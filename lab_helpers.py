@@ -40,21 +40,47 @@ def setup(user, token):
         sh(f'git config user.email "{me["id"]}+{me["login"]}@users.noreply.github.com"')
 
 
-def load_model(name="Qwen/Qwen3-4B-Instruct-2507"):
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    S["tok"] = AutoTokenizer.from_pretrained(name)
-    S["model"] = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16, device_map="auto")
-    print("[OK]   model loaded")
+LMSTUDIO_URL = os.environ.get("LMSTUDIO_URL", "http://localhost:1234/v1")
+
+
+def load_model(name=None, base_url=LMSTUDIO_URL):
+    """Connects to the LM Studio server. With no name, uses the first model LM Studio has loaded."""
+    from openai import OpenAI
+    client = OpenAI(base_url=base_url, api_key="lm-studio")
+    try:
+        available = [m.id for m in client.models.list().data]
+    except Exception as e:
+        return check("LM Studio server reachable", False,
+                     f"start the server in LM Studio (Developer tab) at {base_url} ({type(e).__name__}: {e})")
+    if name is None:
+        try:  # LM Studio's own API says which models are loaded; /v1/models lists every downloaded one
+            with urllib.request.urlopen(base_url.rsplit("/v1", 1)[0] + "/api/v0/models", timeout=5) as r:
+                loaded = [m["id"] for m in json.loads(r.read())["data"]
+                          if m.get("state") == "loaded" and m.get("type") != "embeddings"]
+        except Exception:
+            loaded = []
+        if not (loaded or available):
+            return check("model loaded in LM Studio", False, "load a model in LM Studio first")
+        name = (loaded or available)[0]
+    S.update(client=client, model=name)
+    check(f"model {name} ready", name in available or not available,
+          f"LM Studio does not list this model; available: {available}")
+    return True
+
+
+THINKING_BUDGET = 8000  # extra tokens for "thinking" models, which reason before they answer
 
 
 def ask(skill_text, user_text, max_new_tokens=800):
-    tok, model = S["tok"], S["model"]
     messages = [{"role": "system", "content": skill_text}, {"role": "user", "content": user_text}]
-    enc = tok.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt",
-                                  return_dict=True).to(model.device)
-    out = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False)
-    return tok.decode(out[0][enc["input_ids"].shape[1]:], skip_special_tokens=True)
+    completion = S["client"].chat.completions.create(model=S["model"], messages=messages, temperature=0,
+                                                     max_tokens=max_new_tokens + THINKING_BUDGET, timeout=600)
+    choice = completion.choices[0]
+    text = re.sub(r"<think>.*?(</think>|$)", "", choice.message.content or "", flags=re.S).strip()
+    if not text:
+        print(f"[FAIL] the model gave no answer (finish_reason={choice.finish_reason}).\n"
+              "       Hint: a thinking model may have run out of tokens: raise THINKING_BUDGET or load a non-thinking model")
+    return text
 
 
 def skill(name):
@@ -117,7 +143,7 @@ def write_tests(file):
 def run_tests(file):
     """Runs the tests of one exercise file and shows which pass and which fail."""
     name = file.replace(".py", "")
-    out = sh(f"python -m pytest tests/test_{name}.py -q -rA --no-header -p no:cacheprovider")
+    out = sh(f"PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 {sys.executable} -m pytest tests/test_{name}.py -q -rA --no-header -p no:cacheprovider")
     for line in out.splitlines():
         if line.startswith(("PASSED", "FAILED", "ERROR")):
             status, test = line.split(" ", 1)
@@ -200,8 +226,8 @@ def check_round(n):
             sh(f"cp -r tests {tmp}/")
             with open(f"{tmp}/{file}", "w") as f:
                 f.write(sh(f"git show {first}:{file}"))
-            before = sh(f"python -m pytest tests/test_{name}.py -q -rA --no-header -p no:cacheprovider", cwd=tmp)
-        after = sh(f"python -m pytest tests/test_{name}.py -q -rA --no-header -p no:cacheprovider")
+            before = sh(f"PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 {sys.executable} -m pytest tests/test_{name}.py -q -rA --no-header -p no:cacheprovider", cwd=tmp)
+        after = sh(f"PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 {sys.executable} -m pytest tests/test_{name}.py -q -rA --no-header -p no:cacheprovider")
         status = lambda out: {l.split(" ", 1)[1].split(" - ")[0]: l.split(" ", 1)[0] for l in out.splitlines()
                               if l.startswith(("PASSED", "FAILED", "ERROR"))}
         b, a = status(before), status(after)
